@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from cleaning_utils import (
+    ERROR_EMPTY_DATASET,
     ERROR_JSON_DECODE,
     ValidationError,
     iter_records,
@@ -83,18 +84,31 @@ def main(argv: list[str] | None = None) -> int:
                 print_error(error)
                 printed += 1
 
+    dataset_errors = 0
+    if total == 0:
+        dataset_errors = 1
+        reasons[ERROR_EMPTY_DATASET] += 1
+        if printed < args.max_errors:
+            print_error(
+                ValidationError(
+                    ERROR_EMPTY_DATASET,
+                    "input contains no records",
+                    "$",
+                )
+            )
+
     summary: dict[str, Any] = {
         "input": str(input_path),
         "format": args.format,
         "total": total,
         "valid": total - invalid,
         "invalid": invalid,
+        "dataset_errors": dataset_errors,
         "reasons": dict(reasons),
     }
     print(json.dumps({"summary": summary}, ensure_ascii=False, indent=2))
-    return 0 if invalid == 0 else 1
+    return 0 if invalid == 0 and dataset_errors == 0 else 1
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

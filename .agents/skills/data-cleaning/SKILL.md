@@ -1,121 +1,111 @@
 ---
 name: data-cleaning
-description: Clean, normalize, validate, and convert user-provided datasets into training-ready JSON formats. Use when the user asks to clean data, convert CSV/JSON/JSONL/logs into alpaca/sharegpt/messages, prepare SFT/DPO/tool-use data, inspect dirty dataset samples, generate a cleaning script, or validate cleaned training data.
+description: Inspect, clean, normalize, and validate local or Hugging Face datasets into training-ready Transformers messages, Alpaca, or ShareGPT JSONL. Use when converting CSV/JSON/JSONL, chat or agent trajectories, tool-use traces, preference data, multiple-choice data, or dirty generated data; when writing a reusable deterministic cleaning script; or when validating a cleaned training dataset.
 ---
 
 # Data Cleaning
 
-Turn a raw dataset into training-ready JSON: sample the source, infer its
-shape, confirm the user's intent, write a cleaning script on top of the
-bundled helpers, run it on sample data, validate the target format, then show
-before/after examples for user confirmation.
+Produce a deterministic Python cleaning script, validate its output, and ask
+the user to confirm representative before/after rows. Prefer Transformers
+`messages`; use Alpaca or ShareGPT only when the user explicitly needs them.
+
+## Non-negotiable rules
+
+- Do not guess field semantics from names alone. Confirm ambiguous mappings.
+- Do not call an LLM once per row. An LLM may produce a small, reusable
+  constant such as one system prompt or mapping configuration; embed it in the
+  Python script and apply it to every row.
+- Use the same script and code path for sample and full data.
+- Preserve meaningful Unicode, indentation, Markdown line breaks, code, and
+  tool-call linkage. Clean controls and malformed structure, not content style.
+- Inspect dataset documentation and explicit metadata such as `canary` or
+  `do_not_train`. Exclude benchmark rows that prohibit training.
+- Never silently collapse `chosen`/`rejected` preference data into SFT.
 
 ## Workflow
 
-1. Sample the data source.
-   - The source can be anything: a local file, a shared storage path, a URL,
-     an API, or rows pasted into the chat. Use whatever access method fits;
-     for remote sources fetch a small preview instead of downloading
-     everything.
-   - Only collect enough rows to understand structure. Save 3-5 representative
-     rows to a local JSONL sample file.
+1. Fetch real rows and save a sample.
+   - For Hugging Face, use Terminal and `curl`; do not rely on a rendered web
+     preview. Download a `rows` or `first-rows` API response to JSON.
+   - Extract complete row payloads with:
 
-2. Infer the shape of the data from the sample.
-   - Judge from the rows themselves plus any available context (field names,
-     the user's description, accompanying docs). Common shape families:
-     - Chat arrays: `messages`/`conversations` of role+content turns, possibly
-       stringified JSON, possibly with `tool_calls` and tool-role turns.
-     - Flat pairs: `prompt`/`instruction`/`question` alongside
-       `response`/`output`/`answer`.
-     - Preference pairs: `chosen`/`rejected` (DPO-style).
-     - Multiple-choice: `question` + `choices` + an `answer` index or label.
-     - Event streams: one event per row that must be grouped by a
-       `session_id`/`trace_id`-like key before it forms one conversation.
-     - Raw text or documents with no labels.
-   - Watch for common dirty patterns: stringified JSON inside fields, role
-     aliases (`human`/`gpt`, `from`/`value`), numeric answer indices, empty
-     assistant content that is valid because tool calls are present, oversized
-     rows, exact duplicates, broken JSON.
-   - `cleaning_utils` already normalizes most of these families
-     (`messages_from_record`, `normalize_messages`,
-     `messages_from_trace_events`, `multiple_choice_prompt`,
-     `answer_from_choices`); prefer them over hand-rolled parsing.
+     ```bash
+     PYTHONPATH=<skill>/scripts python <skill>/scripts/extract_hf_rows.py \
+       --input rows-response.json --output sample.jsonl --limit 5
+     ```
 
-3. Explain what the sample appears to contain and ask focused questions.
-   - Confirm the semantic task and target format before writing the script.
-   - Do not infer meaning only from column names.
-   - Ask 1-2 questions at a time, for example: "Should `chosen` be the SFT
-     assistant answer, or do you want a DPO pair with `chosen/rejected`?"
-   - If the sample lacks fields needed for the target format, or the source is
-     non-structured text/events that cannot be converted by deterministic rules,
-     stop the cleaning flow instead of fabricating labels. Tell the user which
-     fields are missing, suggest the minimum schema they should add, and
-     recommend an LLM labeling/generation step before rerunning data cleaning.
-     Example: "This file has only raw documents, but SFT needs an `input` and
-     `output`; generate or provide answer labels, then rerun this skill."
+   - Treat `truncated_cells` as incomplete transport data, not a repairable
+     source row. Fetch full rows or a raw repository file instead.
+   - For gated data, use the user's configured token without printing it.
+   - Also inspect the dataset card for field meaning, license, preference
+     semantics, and training-exclusion canaries.
 
-4. Decide the system prompt (when rows have no system message).
-   - A dataset shares one fixed system prompt; it does not vary row by row, so
-     a missing system prompt never requires per-row labeling.
-   - No tool usage in the data: use the fixed default
-     `You are a helpful assistant.` (`DEFAULT_SYSTEM_PROMPT` in
-     `cleaning_utils`).
-   - Tool usage present (tool calls or tool-role turns): read the sample rows
-     and identify each tool yourself — name, what it does (inferred from its
-     arguments and tool outputs, or from a `tools` definition field when the
-     row has one). Then write one fixed system prompt: state the assistant's
-     role and enumerate the available tools with a one-line description each.
-     Embed it as a string constant in `clean_script.py`.
-   - The sample may not cover every tool in the full file. Have
-     `clean_script.py` collect the distinct tool names it encounters (e.g. in
-     a set, reported alongside stats); if the full run surfaces tools missing
-     from the system prompt, update the prompt and rerun.
-   - In both cases apply it with `ensure_system_message(messages, SYSTEM_PROMPT)`
-     so every output row carries the system message, and show the chosen
-     system prompt to the user during the confirmation step.
+2. Analyze representative rows.
+   - Include ordinary rows plus rare structures: null/empty fields, longest
+     rows, stringified JSON, content blocks, tool calls/results, custom roles,
+     and malformed rows.
+   - Identify whether examples are independent rows or events that must be
+     grouped by a session/trace key.
+   - Read [references/real-world-patterns.md](references/real-world-patterns.md)
+     for proven source-shape decisions.
 
-5. Read references as needed.
-   - For the generated script contract, read
-     [references/script-contract.md](references/script-contract.md).
-   - For target schemas and examples, read
-     [references/target-formats.md](references/target-formats.md).
-   - For reusable examples, read
-     [references/example-scripts.md](references/example-scripts.md).
+3. Confirm intent with the user.
+   - Explain what the sample actually contains and ask 1-2 focused questions.
+   - Confirm the target schema and semantic mapping before writing code.
+   - For DPO, ask whether to preserve preference pairs or explicitly select
+     `chosen`/`rejected` for SFT.
+   - If deterministic transformation cannot create the target labels, stop and
+     name the missing information. Do not fabricate it. Recommend a separate
+     labeling/generation step only when needed.
+
+4. Decide reusable constants.
+   - If rows lack a system message, confirm one fixed prompt and apply it with
+     `ensure_system_message`. Keep an existing non-empty system message unless
+     the user approves replacement.
+   - If the source contains tools, prefer definitions already present in the
+     data. Otherwise infer a single prompt from sampled tool calls/results,
+     scan the full run for unseen tool names, then update and rerun if needed.
+
+5. Read the relevant contracts.
+   - Read [references/script-contract.md](references/script-contract.md) before
+     writing the cleaner.
+   - Read [references/target-formats.md](references/target-formats.md) for the
+     selected target.
+   - Use [references/example-scripts.md](references/example-scripts.md) only
+     for the matching source family.
 
 6. Write `clean_script.py`.
-   - Import helpers with `from cleaning_utils import ...`; never copy
-     `cleaning_utils.py` into the working directory.
-   - Support exactly:
-     `python clean_script.py --input <path> --output <path> [--limit N]`.
-   - End every run by writing `stats.json` next to the output file.
-   - Treat per-row parse/validation failures as dropped rows, not process
-     crashes.
+   - Import helpers with `from cleaning_utils import ...`; do not copy the
+     library.
+   - Support `--input`, `--output`, and optional `--limit` exactly as specified.
+   - Stream rows, isolate per-row failures, perform exact dedupe, enforce the
+     confirmed length threshold, and write `stats.json` beside the output.
+   - Emit only target fields unless the user asks to retain provenance metadata.
 
-7. Run the cleaner with `PYTHONPATH`.
-   - Use:
-     `PYTHONPATH=<skill>/scripts python clean_script.py --input sample.jsonl --output cleaned.jsonl --limit 5`
-   - If it fails, fix the script and rerun.
+7. Run, repair, and validate the sample.
 
-8. Validate the cleaned output.
-   - Use:
-     `PYTHONPATH=<skill>/scripts python <skill>/scripts/validate_format.py --input cleaned.jsonl --format <alpaca|sharegpt|messages>`
-   - If validation fails, return to step 6 and fix the script.
+   ```bash
+   PYTHONPATH=<skill>/scripts python clean_script.py \
+     --input sample.jsonl --output cleaned.jsonl --limit 5
 
-9. Show before/after examples and ask for confirmation.
-   - Present a compact comparison of 1-3 rows, including the system prompt that
-     was added.
-   - If the user is not satisfied, update `clean_script.py` and rerun.
-   - If the sample is accepted, the same script can be run without `--limit` on
-     the local full file.
+   PYTHONPATH=<skill>/scripts python <skill>/scripts/validate_format.py \
+     --input cleaned.jsonl --format messages
+   ```
 
-## Helper Scripts
+   Fix the script and rerun until the validator succeeds. An empty output fails
+   validation; if every row was correctly excluded, report that no training
+   artifact should be produced instead of treating it as success.
 
-- `scripts/cleaning_utils.py`: stdlib-only parsing, normalization, filtering,
-  dedupe, stats, schema validation, and system-prompt injection
-  (`ensure_system_message`, `DEFAULT_SYSTEM_PROMPT`).
-- `scripts/validate_format.py`: CLI validator for `alpaca`, `sharegpt`, and
-  `messages`.
-- `scripts/selftest_cleaning_utils.py`: local self-test over bundled
-  sample-shape fixtures.
-- `scripts/fixtures/example_clean_script.py`: runnable example cleaner over the
-  bundled fixture data.
+8. Show 1-3 compact before/after examples and `stats.json` to the user.
+   Include the fixed system prompt and any lossy decision such as selecting the
+   DPO `chosen` branch. If approved, run the same script without `--limit`.
+
+## Bundled scripts
+
+- `scripts/cleaning_utils.py`: stdlib-only tolerant readers, normalization,
+  tool-trace conversion/linking, filters, dedupe, stats, and schema validation.
+- `scripts/extract_hf_rows.py`: extract complete rows from a downloaded Hugging
+  Face viewer response and reject server-truncated cells.
+- `scripts/validate_format.py`: validate every output row and reject empty data.
+- `scripts/selftest_cleaning_utils.py`: dependency-free regression tests.
+- `scripts/fixtures/example_clean_script.py`: runnable mixed-shape example.

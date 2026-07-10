@@ -1,79 +1,68 @@
 # Cleaning Script Contract
 
-Every generated `clean_script.py` must be runnable with:
+Run every generated cleaner as:
 
 ```bash
 PYTHONPATH=<skill>/scripts python clean_script.py \
-  --input <path> \
-  --output <path> \
-  [--limit N]
+  --input <path> --output <path> [--limit N]
 ```
 
-## Required Behavior
+## Required behavior
 
-- Import helpers with `from cleaning_utils import ...`.
-- Read input with `iter_records()` unless the source needs custom grouping.
-- Stream rows where possible; do not load a large file unless grouping requires
-  it and the sample/full size is known to be small.
-- Treat per-row parse, mapping, validation, duplicate, empty, and too-long
-  failures as dropped rows.
-- Do not stop the whole run for a single bad row.
-- Write UTF-8 JSONL output.
-- Write `stats.json` next to the output path before exiting.
-- Honor `--limit N` by processing at most N input rows or grouped examples.
+- Import `cleaning_utils`; never copy it.
+- Use only Python standard-library runtime dependencies.
+- Perform deterministic row transformation. Do not call an LLM from the
+  script. Embed user-confirmed global constants such as `SYSTEM_PROMPT`.
+- Stream with `iter_records()` unless confirmed grouping requires bounded
+  materialization.
+- Count `--limit N` against input rows or grouped examples, not kept rows.
+- Isolate parse, mapping, validation, length, exclusion, and duplicate failures
+  per row; never abort the run for one bad row.
+- Write UTF-8 JSONL and `stats.json` beside the output before exiting.
+- Keep sample and full runs on the same code path.
 
-## Stats JSON
+Do not add dataset-specific CLI flags. Put confirmed thresholds and mappings in
+named constants so the exact `--input/--output/--limit` interface remains
+portable.
 
-Write this shape:
+## `stats.json`
 
 ```json
 {
   "total": 5,
-  "kept": 4,
-  "dropped": 1,
+  "kept": 3,
+  "dropped": 2,
   "drop_reasons": {
-    "json_decode_error": 1
+    "truncated_field": 1,
+    "duplicate": 1
   },
   "error_samples": [
     {
-      "reason": "json_decode_error",
+      "reason": "truncated_field",
       "line_number": 3,
-      "error": "could not parse JSON",
-      "sample": "{\"bad\":"
+      "error": "Hugging Face preview truncated fields: messages"
     }
   ]
 }
 ```
 
-Use stable reason codes when possible:
+Maintain `total == kept + dropped`. Keep error samples bounded and truncated;
+do not put credentials or full oversized rows in stats.
 
-- `json_decode_error`
-- `missing_field`
-- `type_error`
-- `empty_string`
-- `invalid_role`
-- `invalid_format`
-- `too_long`
-- `duplicate`
+Stable reasons include:
 
-## Error Handling
+- `json_decode_error`, `truncated_field`
+- `missing_field`, `type_error`, `empty_string`, `invalid_role`,
+  `invalid_format`
+- `too_long`, `duplicate`
+- `benchmark_exclusion`
 
-Per-row failures:
+The validator also reports dataset-level `empty_dataset`; an empty output is
+not a valid training artifact.
 
-- JSON parse failure
-- missing required source fields
-- target schema validation failure
-- empty prompt or answer
-- row exceeds configured length
-- exact duplicate
+## Process failures
 
-These should call `stats.record_drop(...)` and continue.
-
-Process-level failures:
-
-- input file missing
-- output directory not writable
-- programmer error in the script
-
-These may exit non-zero. Include enough stderr context to fix the script.
-
+Missing input, unwritable output, or programmer errors may exit non-zero with
+actionable stderr. A deliberate all-row benchmark exclusion may finish the
+cleaner successfully, but `validate_format.py` must reject its empty output and
+the agent must report that no training artifact should be used.

@@ -28,6 +28,9 @@ ERROR_EMPTY_STRING = "empty_string"
 ERROR_JSON_DECODE = "json_decode_error"
 ERROR_INVALID_ROLE = "invalid_role"
 ERROR_INVALID_FORMAT = "invalid_format"
+ERROR_TRUNCATED_FIELD = "truncated_field"
+ERROR_BENCHMARK_EXCLUSION = "benchmark_exclusion"
+ERROR_EMPTY_DATASET = "empty_dataset"
 
 ALLOWED_MESSAGE_ROLES = {"system", "user", "assistant", "tool"}
 ROLE_ALIASES = {
@@ -42,6 +45,8 @@ ROLE_ALIASES = {
     "model": "assistant",
     "answer": "assistant",
     "response": "assistant",
+    "reasoning": "assistant",
+    "tool_call": "assistant",
     "system": "system",
     "developer": "system",
     "tool": "tool",
@@ -54,7 +59,16 @@ ROLE_ALIASES = {
 }
 CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 TRAILING_COMMA_RE = re.compile(r",(\s*[}\]])")
-UNQUOTED_KEY_RE = re.compile(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_\-]*)(\s*:)')
+UNQUOTED_KEY_RE = re.compile(r"([{,]\s*)([A-Za-z_][A-Za-z0-9_\-]*)(\s*:)")
+WRAPPER_TAG_RE = re.compile(
+    r"^\s*<(?:tool_call|tool_response|answer)>\s*|"
+    r"\s*</(?:tool_call|tool_response|answer)>\s*$"
+)
+TRAINING_EXCLUSION_RE = re.compile(
+    r"(?:should\s+never\s+appear\s+in\s+training\s+corpora|"
+    r"do\s+not\s+(?:use\s+(?:this\s+)?(?:data|dataset)\s+to\s+)?train)",
+    re.IGNORECASE,
+)
 
 
 class DataCleaningError(ValueError):
@@ -209,14 +223,15 @@ def decode_text(blob: bytes) -> str:
 def normalize_text(value: Any, *, collapse_spaces: bool = False) -> str:
     """Normalize text, removing unsafe controls while preserving newlines."""
     text = "" if value is None else str(value)
-    text = unicodedata.normalize("NFKC", text)
+    # NFC repairs canonically equivalent sequences without compatibility-folding
+    # meaningful symbols such as 10⁴ into 104.
+    text = unicodedata.normalize("NFC", text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = CONTROL_CHARS_RE.sub("", text)
-    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.split("\n")]
-    text = "\n".join(lines).strip()
     if collapse_spaces:
         text = re.sub(r"\s+", " ", text).strip()
-    return text
+        return text
+    return text.strip()
 
 
 def strip_code_fence(text: str) -> str:
@@ -347,6 +362,55 @@ def iter_records(path: str | Path) -> Iterator[ParsedRecord]:
     yield from iter_jsonl(path)
 
 
+def iter_huggingface_rows(
+    path: str | Path,
+    *,
+    reject_truncated: bool = True,
+) -> Iterator[ParsedRecord]:
+    """Yield row payloads from a Hugging Face rows/first-rows API response.
+
+    The dataset viewer wraps each payload as ``{"row": ..., "row_idx": ...}``.
+    ``truncated_cells`` means the preview is not valid source data; reject such
+    rows by default instead of misclassifying the truncated value as dirty JSON.
+    """
+    parsed_items = list(iter_json(path))
+    if len(parsed_items) != 1 or not parsed_items[0].ok:
+        yield from parsed_items
+        return
+    envelope = parsed_items[0].data
+    if not isinstance(envelope, dict) or not isinstance(envelope.get("rows"), list):
+        yield ParsedRecord(
+            None,
+            1,
+            error="missing Hugging Face rows envelope",
+            error_type=ERROR_INVALID_FORMAT,
+        )
+        return
+    for position, item in enumerate(envelope["rows"], start=1):
+        if not isinstance(item, dict) or "row" not in item:
+            yield ParsedRecord(
+                None,
+                position,
+                error="invalid Hugging Face row wrapper",
+                error_type=ERROR_INVALID_FORMAT,
+            )
+            continue
+        row_number = item.get("row_idx")
+        line_number = row_number + 1 if isinstance(row_number, int) else position
+        truncated = item.get("truncated_cells")
+        if reject_truncated and isinstance(truncated, list) and truncated:
+            fields = ", ".join(normalize_text(field) for field in truncated)
+            yield ParsedRecord(
+                None,
+                line_number,
+                stable_json_dumps(item.get("row")),
+                f"Hugging Face preview truncated fields: {fields}",
+                ERROR_TRUNCATED_FIELD,
+            )
+            continue
+        yield ParsedRecord(item["row"], line_number)
+
+
 def write_jsonl(path: str | Path, records: Iterable[dict[str, Any]]) -> int:
     """Write records as UTF-8 JSONL and return the number written."""
     count = 0
@@ -391,9 +455,28 @@ def missing_required_fields(
     missing: list[str] = []
     for field_path in fields:
         value = get_path(record, field_path)
-        if value is None or normalize_text(value) == "":
+        if (
+            value is None
+            or (isinstance(value, str) and normalize_text(value) == "")
+            or (isinstance(value, (list, dict)) and not value)
+        ):
             missing.append(field_path)
     return missing
+
+
+def training_exclusion_reason(record: dict[str, Any]) -> str | None:
+    """Return a reason when explicit metadata excludes a row from training.
+
+    Only known metadata fields are inspected so user text that merely discusses
+    training-data policies is not accidentally filtered.
+    """
+    for key in ("canary", "benchmark_canary", "training_exclusion"):
+        value = record.get(key)
+        if value is not None and TRAINING_EXCLUSION_RE.search(normalize_text(value)):
+            return f"{key} explicitly excludes this row from training"
+    if record.get("do_not_train") is True:
+        return "do_not_train is true"
+    return None
 
 
 def is_too_long(
@@ -406,10 +489,12 @@ def is_too_long(
     if fields is None:
         text = stable_json_dumps(record)
         return len(text) > max_chars
-    return any(
-        len(normalize_text(get_path(record, path, ""))) > max_chars
-        for path in fields
-    )
+    for path in fields:
+        value = get_path(record, path, "")
+        text = value if isinstance(value, str) else stable_json_dumps(value)
+        if len(text) > max_chars:
+            return True
+    return False
 
 
 def normalize_role(value: Any, *, fallback: str | None = None) -> str:
@@ -424,6 +509,8 @@ def normalize_role(value: Any, *, fallback: str | None = None) -> str:
 
 def normalize_content(value: Any) -> str | list[dict[str, Any]]:
     """Normalize message content while preserving multimodal content parts."""
+    if isinstance(value, dict) and "type" in value:
+        return normalize_content([value])
     if isinstance(value, list):
         parts: list[dict[str, Any]] = []
         for part in value:
@@ -433,7 +520,11 @@ def normalize_content(value: Any) -> str | list[dict[str, Any]]:
             if not isinstance(part, dict):
                 parts.append({"type": "text", "text": normalize_text(part)})
                 continue
-            part_type = normalize_text(part.get("type", "text"), collapse_spaces=True)
+            part_type = normalize_text(
+                part.get("type", "text"), collapse_spaces=True
+            ).lower()
+            if part_type == "image_url":
+                part_type = "image"
             normalized = {"type": part_type or "text"}
             if "text" in part:
                 normalized["text"] = normalize_text(part["text"])
@@ -442,6 +533,12 @@ def normalize_content(value: Any) -> str | list[dict[str, Any]]:
             for key in ("url", "path", "image", "video", "audio"):
                 if key in part:
                     normalized[key] = normalize_text(part[key])
+            image_url = part.get("image_url")
+            if part_type == "image" and "url" not in normalized:
+                if isinstance(image_url, dict):
+                    image_url = image_url.get("url")
+                if image_url:
+                    normalized["url"] = normalize_text(image_url)
             parts.append(normalized)
         return parts
     if isinstance(value, str) or value is None:
@@ -488,15 +585,25 @@ def normalize_tool_call(value: Any) -> dict[str, Any] | None:
     if not name:
         return None
     arguments = function.get("arguments", {})
+    if arguments is None:
+        arguments = {}
     if isinstance(arguments, str):
         try:
             arguments = parse_json_loose(arguments)
         except DataCleaningError:
             arguments = {"raw": arguments}
-    return {
-        "type": value.get("type", "function"),
+    if not isinstance(arguments, dict):
+        arguments = {"value": arguments}
+    call: dict[str, Any] = {
+        "type": normalize_text(value.get("type", "function")) or "function",
         "function": {"name": name, "arguments": arguments},
     }
+    call_id = value.get("id") or value.get("tool_call_id")
+    if call_id is not None:
+        call["id"] = normalize_text(call_id, collapse_spaces=True)
+    if isinstance(value.get("index"), int):
+        call["index"] = value["index"]
+    return call
 
 
 def normalize_tool_calls(value: Any) -> list[dict[str, Any]]:
@@ -518,6 +625,25 @@ def normalize_tool_calls(value: Any) -> list[dict[str, Any]]:
         if call is not None:
             calls.append(call)
     return calls
+
+
+def strip_message_wrapper(value: Any) -> str:
+    """Strip one outer tool_call/tool_response/answer XML-style wrapper."""
+    return WRAPPER_TAG_RE.sub("", normalize_text(value)).strip()
+
+
+def _raw_message_role(item: Any) -> str:
+    """Return a normalized source-role label without alias conversion."""
+    if not isinstance(item, dict):
+        return ""
+    value = (
+        item.get("role")
+        or item.get("from")
+        or item.get("speaker")
+        or item.get("author")
+        or ""
+    )
+    return normalize_text(value, collapse_spaces=True).lower()
 
 
 def _message_content_from_dict(item: dict[str, Any]) -> Any:
@@ -543,6 +669,92 @@ def _coerce_message_sequence(value: Any) -> list[Any]:
     return []
 
 
+def normalize_tool_trace_messages(value: Any) -> list[dict[str, Any]]:
+    """Normalize reasoning/tool_call/tool_output/answer trace roles.
+
+    Reasoning is merged into the following assistant tool call or final answer.
+    XML-style wrappers are removed while the payload becomes a standard
+    ``assistant.tool_calls`` entry and tool result.
+    """
+    raw_messages = _coerce_message_sequence(value)
+    messages: list[dict[str, Any]] = []
+    pending_reasoning: list[str] = []
+    pending_tool_name = ""
+    pending_tool_call_id = ""
+
+    for item in raw_messages:
+        if not isinstance(item, dict):
+            continue
+        raw_role = _raw_message_role(item)
+        content = _message_content_from_dict(item)
+        if raw_role == "reasoning":
+            text = normalize_text(content)
+            if text:
+                pending_reasoning.append(text)
+            continue
+        if raw_role == "tool_call":
+            payload: Any = content
+            if isinstance(payload, str):
+                payload = parse_json_loose(strip_message_wrapper(payload))
+            call = normalize_tool_call(payload)
+            if call is None:
+                raise DataCleaningError("invalid tool_call payload")
+            pending_tool_name = call["function"]["name"]
+            pending_tool_call_id = normalize_text(call.get("id", ""))
+            message: dict[str, Any] = {
+                "role": "assistant",
+                "tool_calls": [call],
+            }
+            reasoning = "\n".join(pending_reasoning)
+            if reasoning:
+                message["content"] = reasoning
+            pending_reasoning.clear()
+            messages.append(message)
+            continue
+        if raw_role in {"tool_output", "tool_result"}:
+            message = {
+                "role": "tool",
+                "content": strip_message_wrapper(content),
+            }
+            if pending_tool_name:
+                message["name"] = pending_tool_name
+            if pending_tool_call_id:
+                message["tool_call_id"] = pending_tool_call_id
+            messages.append(message)
+            pending_tool_name = ""
+            pending_tool_call_id = ""
+            continue
+        if raw_role == "answer":
+            answer = strip_message_wrapper(content)
+            fragments = [*pending_reasoning, answer]
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "\n".join(part for part in fragments if part),
+                }
+            )
+            pending_reasoning.clear()
+            continue
+
+        role = normalize_role(raw_role)
+        message = {"role": role, "content": normalize_content(content)}
+        if role == "tool":
+            message["content"] = content_to_text(message["content"])
+        tool_calls = normalize_tool_calls(
+            item.get("tool_calls") or item.get("tool_call")
+        )
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        for key in ("name", "tool_call_id"):
+            if item.get(key) is not None:
+                message[key] = normalize_text(item[key], collapse_spaces=True)
+        messages.append(message)
+
+    if pending_reasoning:
+        messages.append({"role": "assistant", "content": "\n".join(pending_reasoning)})
+    return messages
+
+
 def normalize_messages(
     value: Any,
     *,
@@ -553,10 +765,20 @@ def normalize_messages(
         try:
             raw_messages = _coerce_message_sequence(value)
         except DataCleaningError:
+            prefix = value.lstrip()
+            if prefix.startswith(("[", "{", '"[', '"{')):
+                raise
             return messages_from_transcript(value)
     else:
         raw_messages = _coerce_message_sequence(value)
+    if any(
+        _raw_message_role(item)
+        in {"reasoning", "tool_call", "tool_output", "tool_result", "answer"}
+        for item in raw_messages
+    ):
+        return normalize_tool_trace_messages(raw_messages)
     messages: list[dict[str, Any]] = []
+    tool_names_by_id: dict[str, str] = {}
     for index, item in enumerate(raw_messages):
         fallback = None
         if assume_alternating_roles:
@@ -585,14 +807,33 @@ def normalize_messages(
             "role": role,
             "content": normalize_content(_message_content_from_dict(item)),
         }
+        if role == "tool":
+            message["content"] = content_to_text(message["content"])
         tool_calls = normalize_tool_calls(
             item.get("tool_calls") or item.get("tool_call")
         )
         if tool_calls:
             message["tool_calls"] = tool_calls
+            for call in tool_calls:
+                call_id = normalize_text(call.get("id", ""), collapse_spaces=True)
+                if call_id:
+                    tool_names_by_id[call_id] = call["function"]["name"]
         for key in ("name", "tool_call_id"):
             if key in item and item[key] is not None:
                 message[key] = normalize_text(item[key], collapse_spaces=True)
+        raw_call_ids = item.get("tool_call_ids")
+        if (
+            "tool_call_id" not in message
+            and isinstance(raw_call_ids, list)
+            and len(raw_call_ids) == 1
+        ):
+            message["tool_call_id"] = normalize_text(
+                raw_call_ids[0], collapse_spaces=True
+            )
+        if role == "tool" and "name" not in message:
+            call_id = message.get("tool_call_id", "")
+            if call_id in tool_names_by_id:
+                message["name"] = tool_names_by_id[call_id]
         messages.append(message)
     return messages
 
@@ -791,8 +1032,20 @@ def messages_from_transcript(value: Any) -> list[dict[str, Any]]:
     return messages
 
 
-def messages_from_record(record: dict[str, Any]) -> list[dict[str, Any]]:
-    """Infer and normalize messages from common training dataset shapes."""
+def messages_from_record(
+    record: dict[str, Any],
+    *,
+    preference: str | None = None,
+) -> list[dict[str, Any]]:
+    """Infer messages, requiring an explicit branch for preference rows."""
+    has_preference_pair = bool(record.get("chosen")) and bool(record.get("rejected"))
+    if has_preference_pair:
+        if preference not in {"chosen", "rejected"}:
+            raise DataCleaningError(
+                "preference row requires preference='chosen' or 'rejected'",
+                code=ERROR_INVALID_FORMAT,
+            )
+        return normalize_messages(record[preference])
     for key in ("messages", "conversations", "conversation", "chosen"):
         if key in record and record[key]:
             return normalize_messages(record[key])
@@ -857,9 +1110,18 @@ def messages_from_record(record: dict[str, Any]) -> list[dict[str, Any]]:
     return messages
 
 
-def to_messages_record(record: dict[str, Any]) -> dict[str, Any]:
-    """Convert a common raw row into the target messages format."""
-    output: dict[str, Any] = {"messages": messages_from_record(record)}
+def to_messages_record(
+    record: dict[str, Any],
+    *,
+    preference: str | None = None,
+    keep_metadata: bool = True,
+) -> dict[str, Any]:
+    """Convert a raw row to messages with explicit preference semantics."""
+    output: dict[str, Any] = {
+        "messages": messages_from_record(record, preference=preference)
+    }
+    if not keep_metadata:
+        return output
     metadata = {
         key: value
         for key, value in record.items()
@@ -869,6 +1131,7 @@ def to_messages_record(record: dict[str, Any]) -> dict[str, Any]:
             "conversations",
             "conversation",
             "chosen",
+            "rejected",
             "events",
             "trace",
             "trajectory",
@@ -938,6 +1201,168 @@ def to_sharegpt_record(record: dict[str, Any]) -> dict[str, Any]:
             }
         )
     return {"conversations": conversations}
+
+
+def _validate_content_parts(
+    content: list[Any],
+    path: str,
+    line_number: int | None,
+) -> list[ValidationError]:
+    """Validate explicit Transformers multimodal content parts."""
+    errors: list[ValidationError] = []
+    if not content:
+        return [
+            ValidationError(
+                ERROR_EMPTY_STRING,
+                "content parts must not be empty",
+                path,
+                line_number,
+            )
+        ]
+    for index, part in enumerate(content):
+        part_path = f"{path}[{index}]"
+        if not isinstance(part, dict):
+            errors.append(
+                ValidationError(
+                    ERROR_TYPE,
+                    "content part must be an object",
+                    part_path,
+                    line_number,
+                )
+            )
+            continue
+        part_type = part.get("type")
+        if not isinstance(part_type, str) or not part_type.strip():
+            errors.append(
+                ValidationError(
+                    ERROR_MISSING_FIELD,
+                    "content part requires type",
+                    f"{part_path}.type",
+                    line_number,
+                )
+            )
+            continue
+        if part_type == "text":
+            text = part.get("text")
+            if not isinstance(text, str):
+                errors.append(
+                    ValidationError(
+                        ERROR_TYPE,
+                        "text content part requires string text",
+                        f"{part_path}.text",
+                        line_number,
+                    )
+                )
+            elif not text.strip():
+                errors.append(
+                    ValidationError(
+                        ERROR_EMPTY_STRING,
+                        "text content part must not be empty",
+                        f"{part_path}.text",
+                        line_number,
+                    )
+                )
+        elif part_type in {"image", "video", "audio"}:
+            location = part.get("url") or part.get("path")
+            if not isinstance(location, str) or not location.strip():
+                errors.append(
+                    ValidationError(
+                        ERROR_MISSING_FIELD,
+                        f"{part_type} content part requires url or path",
+                        part_path,
+                        line_number,
+                    )
+                )
+        else:
+            errors.append(
+                ValidationError(
+                    ERROR_INVALID_FORMAT,
+                    f"unsupported content part type: {part_type}",
+                    f"{part_path}.type",
+                    line_number,
+                )
+            )
+    return errors
+
+
+def _validate_tool_calls(
+    value: Any,
+    path: str,
+    line_number: int | None,
+) -> list[ValidationError]:
+    """Validate Transformers/OpenAI-style function tool calls."""
+    if not isinstance(value, list):
+        return [
+            ValidationError(ERROR_TYPE, "tool_calls must be a list", path, line_number)
+        ]
+    if not value:
+        return [
+            ValidationError(
+                ERROR_EMPTY_STRING,
+                "tool_calls must not be empty",
+                path,
+                line_number,
+            )
+        ]
+    errors: list[ValidationError] = []
+    for index, call in enumerate(value):
+        call_path = f"{path}[{index}]"
+        if not isinstance(call, dict):
+            errors.append(
+                ValidationError(
+                    ERROR_TYPE, "tool call must be an object", call_path, line_number
+                )
+            )
+            continue
+        if call.get("type") != "function":
+            errors.append(
+                ValidationError(
+                    ERROR_INVALID_FORMAT,
+                    "tool call type must be function",
+                    f"{call_path}.type",
+                    line_number,
+                )
+            )
+        function = call.get("function")
+        if not isinstance(function, dict):
+            errors.append(
+                ValidationError(
+                    ERROR_TYPE,
+                    "tool call function must be an object",
+                    f"{call_path}.function",
+                    line_number,
+                )
+            )
+            continue
+        name = function.get("name")
+        if not isinstance(name, str) or not name.strip():
+            errors.append(
+                ValidationError(
+                    ERROR_EMPTY_STRING,
+                    "tool function name must be a non-empty string",
+                    f"{call_path}.function.name",
+                    line_number,
+                )
+            )
+        if not isinstance(function.get("arguments"), dict):
+            errors.append(
+                ValidationError(
+                    ERROR_TYPE,
+                    "tool function arguments must be an object",
+                    f"{call_path}.function.arguments",
+                    line_number,
+                )
+            )
+        if "id" in call and not isinstance(call["id"], str):
+            errors.append(
+                ValidationError(
+                    ERROR_TYPE,
+                    "tool call id must be a string",
+                    f"{call_path}.id",
+                    line_number,
+                )
+            )
+    return errors
 
 
 def validate_messages_record(
@@ -1033,7 +1458,15 @@ def validate_messages_record(
                         line_number,
                     )
                 )
-            elif not content_to_text(content).strip() and not has_tool_calls:
+            elif isinstance(content, list):
+                errors.extend(
+                    _validate_content_parts(
+                        content,
+                        f"{path}.content",
+                        line_number,
+                    )
+                )
+            elif not content.strip() and not has_tool_calls:
                 errors.append(
                     ValidationError(
                         ERROR_EMPTY_STRING,
@@ -1042,15 +1475,48 @@ def validate_messages_record(
                         line_number,
                     )
                 )
-        if "tool_calls" in message and not isinstance(message["tool_calls"], list):
+        if (
+            role == "tool"
+            and has_content
+            and not isinstance(message.get("content"), str)
+        ):
             errors.append(
                 ValidationError(
                     ERROR_TYPE,
-                    "tool_calls must be a list",
+                    "tool content must be a string",
+                    f"{path}.content",
+                    line_number,
+                )
+            )
+        if "tool_calls" in message:
+            if role != "assistant":
+                errors.append(
+                    ValidationError(
+                        ERROR_INVALID_FORMAT,
+                        "tool_calls are only valid on assistant messages",
+                        f"{path}.tool_calls",
+                        line_number,
+                    )
+                )
+            errors.extend(
+                _validate_tool_calls(
+                    message["tool_calls"],
                     f"{path}.tool_calls",
                     line_number,
                 )
             )
+        for key in ("name", "tool_call_id"):
+            if key in message and (
+                not isinstance(message[key], str) or not message[key].strip()
+            ):
+                errors.append(
+                    ValidationError(
+                        ERROR_TYPE,
+                        f"{key} must be a non-empty string",
+                        f"{path}.{key}",
+                        line_number,
+                    )
+                )
     return errors
 
 

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Data Cleaning"
+  short_description: "Clean and validate training datasets"
+  default_prompt: "Use $data-cleaning to inspect this dataset, confirm the target mapping, and produce a validated deterministic cleaning script."

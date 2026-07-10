@@ -41,8 +41,10 @@ import json
 from pathlib import Path
 
 from cleaning_utils import (
+    DEFAULT_SYSTEM_PROMPT,
     CleaningStats,
     answer_from_choices,
+    ensure_system_message,
     iter_records,
     multiple_choice_prompt,
     validate_record,
@@ -73,7 +75,7 @@ with out.open("w", encoding="utf-8") as handle:
             stats.record_drop("missing_field", sample=row)
             continue
         cleaned = {
-            "messages": [
+            "messages": ensure_system_message([
                 {
                     "role": "user",
                     "content": multiple_choice_prompt(
@@ -86,7 +88,7 @@ with out.open("w", encoding="utf-8") as handle:
                     "role": "assistant",
                     "content": answer_from_choices(row.get("answer"), choices),
                 },
-            ]
+            ], DEFAULT_SYSTEM_PROMPT)
         }
         errors = validate_record(cleaned, "messages")
         if errors:
@@ -97,6 +99,31 @@ with out.open("w", encoding="utf-8") as handle:
 
 stats.write_json(out.with_name("stats.json"))
 ```
+
+## Tool Traces and Training Exclusions
+
+`normalize_messages` parses stringified standard messages and auto-detects the
+custom `reasoning/tool_call/tool_output/answer` sequence:
+
+```python
+from cleaning_utils import normalize_messages
+
+cleaned = {"messages": normalize_messages(row["messages"])}
+```
+
+Filter explicit benchmark metadata before conversion:
+
+```python
+from cleaning_utils import training_exclusion_reason
+
+reason = training_exclusion_reason(row)
+if reason:
+    stats.record_drop("benchmark_exclusion", error=reason, sample=row)
+    continue
+```
+
+Do not substitute these filters for reading the dataset card; they only catch
+explicit row metadata.
 
 ## Example 2: DPO-Style Source (chosen/rejected) to SFT `messages`
 
@@ -138,7 +165,11 @@ with out.open("w", encoding="utf-8") as handle:
         if not parsed.ok or not isinstance(parsed.data, dict):
             stats.record_drop(parsed.error_type or "type_error", sample=parsed.raw)
             continue
-        cleaned = to_messages_record(parsed.data)
+        cleaned = to_messages_record(
+            parsed.data,
+            preference="chosen",
+            keep_metadata=False,
+        )
         errors = validate_record(cleaned, "messages")
         if errors:
             stats.record_drop(
@@ -155,4 +186,3 @@ with out.open("w", encoding="utf-8") as handle:
 
 stats.write_json(out.with_name("stats.json"))
 ```
-

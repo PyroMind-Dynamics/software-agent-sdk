@@ -57,7 +57,12 @@ def main() -> int:
                     line_number=parsed.line_number,
                 )
                 continue
-            cleaned = to_messages_record(parsed.data)
+            preference = "chosen" if "rejected" in parsed.data else None
+            cleaned = to_messages_record(
+                parsed.data,
+                preference=preference,
+                keep_metadata=False,
+            )
             cleaned["messages"] = ensure_system_message(
                 cleaned["messages"], DEFAULT_SYSTEM_PROMPT
             )
@@ -97,4 +102,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
