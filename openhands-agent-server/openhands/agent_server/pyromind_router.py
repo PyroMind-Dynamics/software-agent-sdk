@@ -23,10 +23,11 @@ from openhands.agent_server.conversation_service import (
     ConversationService,
 )
 from openhands.agent_server.dependencies import (
+    _get_validation_cluster_header,
     get_conversation_service,
     get_current_user_id,
     get_event_service,
-    get_pyromind_jwt_token_from_request,
+    resolve_pyromind_auth_token,
 )
 from openhands.agent_server.event_service import EventService
 from openhands.agent_server.models import ConversationInfo, Success
@@ -36,17 +37,22 @@ from openhands.agent_server.pyromind_auth import (
     bind_debug_current_login_user_to_conversation,
     get_debug_current_login_user_by_conversation,
     is_dev,
+    parse_auth_token_from_cookie_header,
 )
 from openhands.agent_server.pyromind_constants import (
     PYROMIND_APP_TAG_KEY,
     PYROMIND_APP_TAG_VALUE,
+)
+from openhands.agent_server.run_workflow_callback import (
+    RunWorkflowCallbackResult,
+    deliver_run_workflow_status,
 )
 from openhands.sdk import LLM, AgentContext, TextContent, Tool
 from openhands.sdk.conversation.request import (
     StartConversationRequest,
 )
 from openhands.sdk.llm.message import Message
-from openhands.sdk.secret import SecretSource, StaticSecret
+from openhands.sdk.secret import SecretSource, SecretValue, StaticSecret
 from openhands.sdk.skills import Skill, load_skills_from_dir
 from openhands.sdk.workspace import LocalWorkspace
 from openhands.tools.preset.codex import get_codex_agent
@@ -55,13 +61,27 @@ from openhands.tools.pyromind_dataset import (
     PreviewDatasetTool,
     UploadFileToPyromindTool,
 )
+from openhands.tools.pyromind_dataset.definition import (
+    PYROMIND_STORAGE_AUTH_COOKIE_SECRET,
+    PYROMIND_STORAGE_HEADERS_STATE_KEY,
+)
 from openhands.tools.pyromind_debug import get_debug_result_broker
-from openhands.tools.workflow import DslToXyflowTool, ValidateWorkflowDslTool
-from openhands.tools.workflow.dsl_to_xyflow import convert_xyflow_to_dsl
+from openhands.tools.workflow import (
+    DslToXyflowTool,
+    RunWorkflowTool,
+    ValidateWorkflowDslTool,
+)
+from openhands.tools.workflow.dsl_to_xyflow import (
+    DslToXyflowTool,
+    convert_xyflow_to_dsl,
+)
 from openhands.tools.workflow.validate_workflow_dsl import (
     PYROMIND_VALIDATE_AUTH_COOKIE_SECRET,
     PYROMIND_VALIDATE_HEADERS_STATE_KEY,
 )
+
+
+PYROMIND_AUTH_TOKEN_SECRET = "auth_token"
 
 
 logger = logging.getLogger(__name__)
@@ -211,22 +231,139 @@ def _build_workflow_validation_tool(
     return Tool(name=ValidateWorkflowDslTool.name, params=params), secrets
 
 
+def _load_env_to_tools(
+    http_request: Request, params: dict[str, Any], secrets: dict[str, SecretSource]
+) -> tuple[dict[str, Any], dict[str, SecretSource]]:
+    """
+    加载通用环境变量
+    """
+    params = params if params else {}
+    secrets = secrets if secrets else {}
+
+    params["current_user"] = getattr(http_request.state, "current_user", None)
+    params["env"] = getattr(http_request.state, "env", None)
+    params["cluster"] = getattr(http_request.state, "cluster", None)
+
+    ## 拷贝请求头 不包含认证信息，一般的环境信息拷贝
+    headers = {
+        name: _value
+        for name in _PYROMIND_VALIDATE_FORWARD_HEADERS
+        if (_value := http_request.headers.get(name))
+    }
+    if cluster := _get_validation_cluster_header(http_request, {}):
+        headers["x-cluster"] = cluster
+    headers["request-app"] = "openhands"
+    params["headers"] = headers
+
+    return params, secrets
+
+
+def _load_auth_token(
+    http_request: Request, secrets: dict[str, SecretSource]
+) -> dict[str, SecretSource]:
+    """
+    加载通用环境变量
+    """
+    secrets = secrets if secrets else {}
+    if auth_token := resolve_pyromind_auth_token(
+        cookies=http_request.cookies,
+        cookie_header=http_request.headers.get("cookie"),
+    ):
+        secrets[PYROMIND_AUTH_TOKEN_SECRET] = StaticSecret(value=SecretStr(auth_token))
+    return secrets
+
+
+def _build_workflow_run_tool(
+    http_request: Request,
+    extra: dict[str, Any],
+) -> tuple[Tool, dict[str, SecretSource]]:
+    params: dict[str, Any] = {}
+    secrets: dict[str, SecretSource] = {}
+
+    ## 加载通用属性
+    params, secrets = _load_env_to_tools(
+        http_request=http_request, params=params, secrets=secrets
+    )
+
+    ## 加载用户认证token
+    secrets = _load_auth_token(http_request=http_request, secrets=secrets)
+
+    ## 返回工具参数，会话级别
+    return Tool(name=RunWorkflowTool.name, params=params), secrets
+
+
+def _build_pyromind_storage_tools(
+    http_request: Request,
+    extra: dict[str, Any],
+) -> tuple[list[Tool], dict[str, SecretSource]]:
+    headers = {
+        name: value
+        for name in _PYROMIND_VALIDATE_FORWARD_HEADERS
+        if name != "x-cluster" and (value := http_request.headers.get(name))
+    }
+    if cluster := _get_validation_cluster_header(http_request, extra):
+        headers["x-cluster"] = cluster
+
+    params: dict[str, Any] = {}
+    storage_base_url = extra.get("storage_base_url", extra.get("storage_api_base_url"))
+    if isinstance(storage_base_url, str) and storage_base_url:
+        params["storage_base_url"] = storage_base_url
+    if headers:
+        params["headers"] = headers
+
+    secrets: dict[str, SecretSource] = {}
+    secret_headers: dict[str, str] = {}
+    cookie_header = _get_validation_cookie_header(http_request)
+    if cookie_header:
+        secret_headers["cookie"] = PYROMIND_STORAGE_AUTH_COOKIE_SECRET
+        secrets[PYROMIND_STORAGE_AUTH_COOKIE_SECRET] = StaticSecret(
+            value=SecretStr(cookie_header)
+        )
+    if secret_headers:
+        params["secret_headers"] = secret_headers
+
+    return (
+        [
+            Tool(name=PreviewDatasetTool.name, params=dict(params)),
+            Tool(name=UploadFileToPyromindTool.name, params=dict(params)),
+        ],
+        secrets,
+    )
+
+
 async def apply_pyromind_validation_context(
     event_service: EventService,
     current_user: CurrentLoginUser | None,
 ) -> None:
+    """Refresh Pyromind portal auth context when a client (re)connects over WebSocket.
+
+    Updates validate cookie secrets, the run_workflow ``auth_token`` secret, and
+    forwarded ``x-cluster`` agent state from the current login session.
+    """
     if current_user is None:
         return
     if event_service.stored.tags.get(PYROMIND_APP_TAG_KEY) != PYROMIND_APP_TAG_VALUE:
         return
 
+    secrets_update: dict[str, SecretValue] = {}
     if current_user.cookie:
-        await event_service.update_secrets(
-            {PYROMIND_VALIDATE_AUTH_COOKIE_SECRET: current_user.cookie}
-        )
+        secrets_update[PYROMIND_VALIDATE_AUTH_COOKIE_SECRET] = current_user.cookie
+        secrets_update[PYROMIND_STORAGE_AUTH_COOKIE_SECRET] = current_user.cookie
+    if auth_token := parse_auth_token_from_cookie_header(current_user.cookie):
+        secrets_update[PYROMIND_AUTH_TOKEN_SECRET] = auth_token
+    if secrets_update:
+        await event_service.update_secrets(secrets_update)
+
     if current_user.x_cluster:
         await event_service.update_agent_state(
-            {PYROMIND_VALIDATE_HEADERS_STATE_KEY: {"x-cluster": current_user.x_cluster}}
+            {
+                PYROMIND_VALIDATE_HEADERS_STATE_KEY: {
+                    "x-cluster": current_user.x_cluster
+                },
+                PYROMIND_STORAGE_HEADERS_STATE_KEY: {
+                    "x-cluster": current_user.x_cluster
+                },
+            }
         )
 
 
@@ -239,24 +376,12 @@ def _get_validation_cookie_header(http_request: Request) -> str | None:
     if raw_cookie:
         return raw_cookie
 
-    auth_token = get_pyromind_jwt_token_from_request(http_request)
-    if auth_token:
+    if auth_token := resolve_pyromind_auth_token(
+        cookies=http_request.cookies,
+        cookie_header=http_request.headers.get("cookie"),
+    ):
         return f"{PYROMIND_AUTH_COOKIE_NAME}={auth_token}"
     return None
-
-
-def _get_validation_cluster_header(
-    http_request: Request,
-    extra: dict[str, Any],
-) -> str | None:
-    current_user = getattr(http_request.state, "current_user", None)
-    if isinstance(current_user, CurrentLoginUser) and current_user.x_cluster:
-        return current_user.x_cluster
-
-    cluster = extra.get("x_cluster", extra.get("x-cluster"))
-    if isinstance(cluster, str) and cluster:
-        return cluster
-    return http_request.headers.get("x-cluster")
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +501,36 @@ class PyromindDebugCallbackRequest(BaseModel):
     error_log: str | None = Field(
         default=None, description="Runtime error output when status='failed'."
     )
+
+
+class PyromindWorkflowCallbackRequest(BaseModel):
+    """Temporary webhook payload simulating a Kafka run_workflow status message."""
+
+    task_id: str = Field(description="Platform task id from studio.create().")
+    status: str = Field(
+        description="Raw workflow status from the platform or Kafka message."
+    )
+    conversation_id: str = Field(
+        description="Conversation to resume; usually from task out_id / Kafka."
+    )
+    error_log: str | None = Field(
+        default=None,
+        description="Runtime error log when status is Failed or Error.",
+    )
+    auto_run: bool = Field(
+        default=True,
+        description="Restart the agent on the target conversation after delivery.",
+    )
+
+
+class PyromindWorkflowCallbackResponse(BaseModel):
+    """Result of the temporary run_workflow webhook (for manual / Kafka simulation)."""
+
+    success: bool = True
+    outcome: str
+    task_id: str
+    normalized_status: str | None = None
+    conversation_id: str | None = None
 
 
 def _normalize_dsl(text: str) -> str:
@@ -639,6 +794,13 @@ async def create_pyromind_conversation(
         http_request, request.extra
     )
 
+    # run_workflow reuses validate auth/header wiring / 运行工具复用校验鉴权配置
+    run_tool, run_secrets = _build_workflow_run_tool(http_request, request.extra)
+    # storage
+    storage_tools, storage_secrets = _build_pyromind_storage_tools(
+        http_request, request.extra
+    )
+
     # 4. Build LLM config
     llm = LLM(
         usage_id="pyromind-agent",
@@ -657,9 +819,9 @@ async def create_pyromind_conversation(
         extra_tools=[
             Tool(name="grep"),
             Tool(name="file_editor"),
-            Tool(name="debug_workflow"),
-            Tool(name=PreviewDatasetTool.name),
-            Tool(name=UploadFileToPyromindTool.name),
+            Tool(name=RunWorkflowTool.name, params=run_tool.params),
+            *storage_tools,
+            Tool(name=DslToXyflowTool.name),
             validation_tool,
         ],
     )
@@ -685,7 +847,7 @@ async def create_pyromind_conversation(
         workspace=workspace,
         conversation_id=conversation_id,
         initial_message=None,
-        secrets=validation_secrets,
+        secrets={**validation_secrets, **storage_secrets},
         tags={PYROMIND_APP_TAG_KEY: PYROMIND_APP_TAG_VALUE},
         user_id=user_id,
     )
@@ -730,6 +892,7 @@ async def create_pyromind_conversation(
     responses={404: {"description": "Conversation not found"}},
 )
 async def send_pyromind_message(
+    http_request: Request,
     request: PyromindSendMessageRequest,
     event_service: EventService = Depends(get_event_service),
 ) -> Success:
@@ -743,6 +906,10 @@ async def send_pyromind_message(
     (not into the user's visible message) so the agent knows to treat the
     current file as authoritative.
     """
+    current_user = getattr(http_request.state, "current_user", None)
+    if isinstance(current_user, CurrentLoginUser):
+        await apply_pyromind_validation_context(event_service, current_user)
+
     conversation = event_service.get_conversation()
     working_dir = Path(conversation.workspace.working_dir)
     workflow_dsl = _workflow_dsl_from_xyflow(request.workflow_xyflow)
@@ -845,3 +1012,39 @@ async def pyromind_debug_callback(request: PyromindDebugCallbackRequest) -> Succ
             detail=f"Unknown or already-resolved debug task: {request.task_id}",
         )
     return Success()
+
+
+@pyromind_debug_webhook_router.post(
+    "/workflow/callback",
+    response_model=PyromindWorkflowCallbackResponse,
+)
+async def pyromind_workflow_callback(
+    request: PyromindWorkflowCallbackRequest,
+) -> PyromindWorkflowCallbackResponse:
+    """Temporary webhook to simulate Kafka run_workflow terminal status delivery.
+
+    Calls :func:`deliver_run_workflow_status` so manual HTTP clients can test the
+    async resume path without a Kafka consumer. Mounted on the same unauthenticated
+    webhook router as ``/debug/callback`` — internal/trusted network only.
+    """
+    result: RunWorkflowCallbackResult = await deliver_run_workflow_status(
+        task_id=request.task_id,
+        status=request.status,
+        error_log=request.error_log,
+        conversation_id=request.conversation_id,
+        auto_run=request.auto_run,
+    )
+    if result.outcome in {"unknown_task", "unknown_conversation"}:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"run_workflow callback failed for task_id={request.task_id}: "
+                f"{result.outcome}"
+            ),
+        )
+    return PyromindWorkflowCallbackResponse(
+        outcome=result.outcome,
+        task_id=result.task_id,
+        normalized_status=result.normalized_status,
+        conversation_id=result.conversation_id,
+    )
