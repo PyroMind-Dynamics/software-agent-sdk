@@ -1,0 +1,155 @@
+# syntax=docker/dockerfile:1.7
+
+# NOTE: LC_ALL/LANG must be set to C.UTF-8 for libtmux to work correctly with
+# PyInstaller builds. Without proper locale, tmux converts UTF-8 separator
+# characters to underscores, breaking libtmux's format parsing.
+ARG BASE_IMAGE=nikolaik/python-nodejs:python3.13-nodejs22-slim
+ARG USERNAME=openhands
+ARG UID=10001
+ARG GID=10001
+ARG PORT=8000
+# Opt-in build flag for the Vertex AI extra (`openhands-sdk[vertex]`). Off by
+# default to keep the published image lean. Pass `--build-arg ENABLE_VERTEX=1`
+# to bundle google-cloud-aiplatform so the resulting binary supports
+# `vertex_ai/*` partner models (MiniMax, Qwen, Kimi MaaS endpoints).
+ARG ENABLE_VERTEX=0
+
+####################################################################################
+# Builder (source mode)
+# We copy source + build a venv here for local dev and debugging.
+#
+# SELF-CONTAINED /agent-server CONTRACT:
+# uv installs python-build-standalone into /agent-server/uv-managed-python and
+# creates .venv against it. Both live under /agent-server, so downstream
+# consumers can COPY /agent-server onto any base image and the venv works.
+#
+# uv >= 0.11.5 pulls python-build-standalone >= 20260408, which ships
+# libpython without PT_GNU_STACK PF_X (executable stack). Earlier releases
+# had this flag set due to LLVM/BOLT bugs, causing glibc >= 2.41 and
+# DinD/sysbox/seccomp to reject dlopen() with "cannot enable executable
+# stack". No sanitizer or workaround is needed on fixed releases.
+# See OpenHands/software-agent-sdk#2761.
+####################################################################################
+FROM python:3.13-bookworm AS builder
+ARG USERNAME UID GID ENABLE_VERTEX
+ENV UV_PROJECT_ENVIRONMENT=/agent-server/.venv
+ENV UV_PYTHON_INSTALL_DIR=/agent-server/uv-managed-python
+
+# uv 0.11.5+ embeds python-build-standalone 20260408 metadata, which is the
+# first release with the PT_GNU_STACK fix. Pin to 0.11.6 (latest at time of
+# writing) rather than :latest so builds are reproducible.
+COPY --from=ghcr.io/astral-sh/uv:0.11.6 /uv /uvx /bin/
+
+RUN groupadd -g ${GID} ${USERNAME} \
+ && useradd -m -u ${UID} -g ${GID} -s /usr/sbin/nologin ${USERNAME} \
+ && mkdir -p /agent-server/uv-managed-python \
+ && chown -R ${USERNAME}:${USERNAME} /agent-server
+USER ${USERNAME}
+WORKDIR /agent-server
+# Cache-friendly: lockfiles first
+COPY --chown=${USERNAME}:${USERNAME} pyproject.toml uv.lock README.md LICENSE ./
+COPY --chown=${USERNAME}:${USERNAME} openhands-sdk ./openhands-sdk
+COPY --chown=${USERNAME}:${USERNAME} openhands-tools ./openhands-tools
+COPY --chown=${USERNAME}:${USERNAME} openhands-workspace ./openhands-workspace
+COPY --chown=${USERNAME}:${USERNAME} openhands-agent-server ./openhands-agent-server
+RUN --mount=type=cache,target=/home/${USERNAME}/.cache,uid=${UID},gid=${GID} \
+    EXTRA_FLAGS=""; \
+    if [ "$ENABLE_VERTEX" = "1" ]; then EXTRA_FLAGS="--extra vertex"; fi; \
+    uv python install 3.13 && \
+    uv venv --python-preference only-managed --python 3.13 .venv && \
+    uv sync --frozen --no-editable --managed-python --extra boto3 $EXTRA_FLAGS && \
+    readlink -f .venv/bin/python | grep -q '^/agent-server/uv-managed-python/'
+
+####################################################################################
+# Binary Builder (binary mode)
+# We run pyinstaller here to produce openhands-agent-server
+####################################################################################
+FROM builder AS binary-builder
+ARG USERNAME UID GID ENABLE_VERTEX
+
+# We need --dev for pyinstaller
+RUN --mount=type=cache,target=/home/${USERNAME}/.cache,uid=${UID},gid=${GID} \
+    EXTRA_FLAGS=""; \
+    if [ "$ENABLE_VERTEX" = "1" ]; then EXTRA_FLAGS="--extra vertex"; fi; \
+    uv sync --frozen --dev --no-editable --extra boto3 $EXTRA_FLAGS
+
+RUN --mount=type=cache,target=/home/${USERNAME}/.cache,uid=${UID},gid=${GID} \
+    uv run pyinstaller openhands-agent-server/openhands/agent_server/agent-server.spec
+# Fail fast if the expected binary is missing
+RUN test -x /agent-server/dist/openhands-agent-server
+
+
+####################################################################################
+FROM pyrominddynamics/software-agent-sdk:feat-dockerbase-466c0d6d-07150232 AS base-image
+ARG USERNAME
+
+USER root
+# --- VSCode Web ---
+ENV EDITOR=code \
+    VISUAL=code \
+    GIT_EDITOR="code --wait" \
+    OPENVSCODE_SERVER_ROOT=/openhands/.openvscode-server
+ARG RELEASE_TAG="openvscode-server-v1.98.2"
+ARG RELEASE_ORG="gitpod-io"
+
+COPY --chown=${USERNAME}:${USERNAME} --from=builder /agent-server/openhands-agent-server/openhands/agent_server/vscode_extensions ${OPENVSCODE_SERVER_ROOT}/extensions
+ENV NOVNC_WEB=/usr/share/novnc \
+    NOVNC_PORT=8002 \
+    DISPLAY=:1 \
+    VNC_GEOMETRY=1280x800 \
+    CHROME_BIN=/usr/bin/chromium \
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium \
+    CHROMIUM_FLAGS="--no-sandbox --disable-dev-shm-usage --disable-gpu"
+
+RUN chown -R ${USERNAME}:${USERNAME} ${NOVNC_WEB}
+# Override default XFCE wallpaper
+COPY --chown=${USERNAME}:${USERNAME} openhands-agent-server/openhands/agent_server/docker/wallpaper.svg /usr/share/backgrounds/xfce/xfce-shapes.svg
+
+USER ${USERNAME}
+WORKDIR /
+ENV OH_ENABLE_VNC=false
+ENV LOG_JSON=true
+EXPOSE ${PORT} ${NOVNC_PORT}
+
+
+####################################################################################
+####################################################################################
+# Build Targets
+####################################################################################
+####################################################################################
+
+############################
+# Target A: source
+# Local dev and debugging mode: copy source + venv from builder
+############################
+FROM base-image AS source
+ARG USERNAME
+COPY --chown=${USERNAME}:${USERNAME} --from=builder /agent-server /agent-server
+ENTRYPOINT ["tini", "--", "/agent-server/.venv/bin/python", "-m", "openhands.agent_server"]
+
+FROM base-image-minimal AS source-minimal
+ARG USERNAME
+COPY --chown=${USERNAME}:${USERNAME} --from=builder /agent-server /agent-server
+ENTRYPOINT ["tini", "--", "/agent-server/.venv/bin/python", "-m", "openhands.agent_server"]
+
+############################
+# Target B: binary-runtime
+# Production mode: build the binary inside Docker and copy it in.
+# NOTE: no support for external artifact contexts anymore.
+############################
+FROM base-image AS binary
+ARG USERNAME
+
+COPY --chown=${USERNAME}:${USERNAME} --from=binary-builder /agent-server/dist/openhands-agent-server /usr/local/bin/openhands-agent-server
+RUN chmod +x /usr/local/bin/openhands-agent-server
+# Fix library path to use system GCC libraries instead of bundled ones
+ENV LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:/usr/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+ENTRYPOINT ["tini", "--", "/usr/local/bin/openhands-agent-server"]
+
+FROM pyrominddynamics/software-agent-sdk:feat-dockerbase-466c0d6d-07150232 AS binary-minimal
+ARG USERNAME
+COPY --chown=${USERNAME}:${USERNAME} --from=binary-builder /agent-server/dist/openhands-agent-server /usr/local/bin/openhands-agent-server
+RUN chmod +x /usr/local/bin/openhands-agent-server
+# Fix library path to use system GCC libraries instead of bundled ones
+ENV LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:/usr/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+ENTRYPOINT ["tini", "--", "/usr/local/bin/openhands-agent-server"]
